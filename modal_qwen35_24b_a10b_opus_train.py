@@ -34,6 +34,8 @@ SKIP_WORKING_COPY_FILENAMES = {
     "model.safetensors",
     "stale_model_stale.safetensors",
 }
+LANGUAGE_MODEL_PREFIX = "model.language_model."
+VISION_PREFIX = "model.visual."
 
 DEFAULT_MAX_SEQ_LENGTH = 8192
 DEFAULT_EPOCHS = 4
@@ -175,6 +177,9 @@ def patch_tokenizer_files(snapshot_path: Path) -> dict:
 
 
 def prepare_text_only_model_copy(source_path: Path, target_path: Path) -> dict:
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
     config_path = source_path / "config.json"
     if not config_path.exists():
         raise FileNotFoundError(f"Missing config.json under {source_path}")
@@ -184,6 +189,10 @@ def prepare_text_only_model_copy(source_path: Path, target_path: Path) -> dict:
     target_path.mkdir(parents=True, exist_ok=True)
     for item in source_path.iterdir():
         if item.name in SKIP_WORKING_COPY_FILENAMES:
+            continue
+        if item.suffix == ".safetensors":
+            continue
+        if item.name == "model.safetensors.index.json":
             continue
         destination = target_path / item.name
         if item.is_dir():
@@ -215,9 +224,55 @@ def prepare_text_only_model_copy(source_path: Path, target_path: Path) -> dict:
     if "transformers_version" in source_config:
         text_config["transformers_version"] = source_config["transformers_version"]
     text_config["tie_word_embeddings"] = source_config.get("tie_word_embeddings", False)
+    text_config["model_type"] = "qwen3_5_moe_text"
 
     target_config_path.write_text(json.dumps(text_config, indent=2) + "\n", encoding="utf-8")
     patch_tokenizer_files(target_path)
+
+    source_index_path = source_path / "model.safetensors.index.json"
+    if not source_index_path.exists():
+        raise FileNotFoundError(f"Missing model.safetensors.index.json under {source_path}")
+    source_index = json.loads(source_index_path.read_text(encoding="utf-8"))
+
+    target_weight_map = {}
+    total_size = 0
+    shard_summaries = []
+    shard_names = sorted(set(source_index["weight_map"].values()))
+    for shard_name in shard_names:
+        source_shard_path = source_path / shard_name
+        renamed_tensors = {}
+        with safe_open(source_shard_path, framework="pt", device="cpu") as source_file:
+            for tensor_name in source_file.keys():
+                if tensor_name.startswith(VISION_PREFIX):
+                    continue
+                if tensor_name.startswith(LANGUAGE_MODEL_PREFIX):
+                    target_tensor_name = "model." + tensor_name[len(LANGUAGE_MODEL_PREFIX):]
+                else:
+                    target_tensor_name = tensor_name
+                renamed_tensors[target_tensor_name] = source_file.get_tensor(tensor_name)
+
+        if not renamed_tensors:
+            continue
+
+        target_shard_path = target_path / shard_name
+        save_file(renamed_tensors, str(target_shard_path), metadata={"source": str(source_shard_path)})
+        total_size += target_shard_path.stat().st_size
+        for tensor_name in renamed_tensors:
+            target_weight_map[tensor_name] = shard_name
+        shard_summaries.append({"shard": shard_name, "tensor_count": len(renamed_tensors)})
+
+    target_index = {
+        "metadata": {
+            "total_size": total_size,
+            "text_only_conversion": True,
+            "source_model_snapshot_dir": str(source_path),
+        },
+        "weight_map": target_weight_map,
+    }
+    (target_path / "model.safetensors.index.json").write_text(
+        json.dumps(target_index, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
     return {
         "source_model_snapshot_dir": str(source_path),
@@ -225,6 +280,7 @@ def prepare_text_only_model_copy(source_path: Path, target_path: Path) -> dict:
         "removed_multimodal_keys": removed_keys,
         "text_architecture": text_config["architectures"][0],
         "num_experts": text_config["num_experts"],
+        "created_text_only_shards": shard_summaries,
     }
 
 

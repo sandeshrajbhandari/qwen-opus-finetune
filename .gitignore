@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.hf_compare_cache/
+.DS_Store
+
+.env
+.venv/
+venv/
+
+*.log

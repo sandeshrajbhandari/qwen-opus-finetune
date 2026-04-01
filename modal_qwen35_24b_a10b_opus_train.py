@@ -176,6 +176,70 @@ def patch_tokenizer_files(snapshot_path: Path) -> dict:
     return result
 
 
+def inspect_text_only_snapshot(snapshot_path: Path) -> dict:
+    config_path = snapshot_path / "config.json"
+    index_path = snapshot_path / "model.safetensors.index.json"
+    if not config_path.exists() or not index_path.exists():
+        return {
+            "is_ready": False,
+            "reason": "missing_config_or_index",
+        }
+
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    architectures = config.get("architectures") or []
+    if (
+        config.get("model_type") != "qwen3_5_moe_text"
+        or architectures != ["Qwen3_5MoeForCausalLM"]
+        or config.get("num_experts") != 39
+        or "vision_config" in config
+    ):
+        return {
+            "is_ready": False,
+            "reason": "config_not_text_only",
+            "architectures": architectures,
+            "model_type": config.get("model_type"),
+            "num_experts": config.get("num_experts"),
+        }
+
+    index_data = json.loads(index_path.read_text(encoding="utf-8"))
+    weight_map = index_data.get("weight_map", {})
+    if not weight_map:
+        return {
+            "is_ready": False,
+            "reason": "empty_weight_map",
+        }
+
+    has_language_model_prefix = any(name.startswith(LANGUAGE_MODEL_PREFIX) for name in weight_map)
+    has_vision_prefix = any(name.startswith(VISION_PREFIX) for name in weight_map)
+    has_model_layers = any(name.startswith("model.layers.") for name in weight_map)
+    if has_language_model_prefix or has_vision_prefix or not has_model_layers:
+        return {
+            "is_ready": False,
+            "reason": "weight_map_not_text_only",
+            "has_language_model_prefix": has_language_model_prefix,
+            "has_vision_prefix": has_vision_prefix,
+            "has_model_layers": has_model_layers,
+        }
+
+    shard_names = sorted(set(weight_map.values()))
+    missing_shards = [shard_name for shard_name in shard_names if not (snapshot_path / shard_name).exists()]
+    if missing_shards:
+        return {
+            "is_ready": False,
+            "reason": "missing_shards",
+            "missing_shards": missing_shards,
+        }
+
+    return {
+        "is_ready": True,
+        "reason": "ready",
+        "architectures": architectures,
+        "model_type": config.get("model_type"),
+        "num_experts": config.get("num_experts"),
+        "shard_count": len(shard_names),
+    }
+
+
 def prepare_text_only_model_copy(source_path: Path, target_path: Path) -> dict:
     from safetensors import safe_open
     from safetensors.torch import save_file
@@ -329,10 +393,23 @@ def prepare_text_only_snapshot():
     source_path = Path(MODEL_SNAPSHOT_DIR)
     if not (source_path / "config.json").exists():
         raise FileNotFoundError(f"Missing config.json under {source_path}")
-    result = prepare_text_only_model_copy(
-        source_path=source_path,
-        target_path=Path(TEXT_ONLY_MODEL_SNAPSHOT_DIR),
-    )
+    target_path = Path(TEXT_ONLY_MODEL_SNAPSHOT_DIR)
+    inspection = inspect_text_only_snapshot(target_path)
+    if inspection["is_ready"]:
+        result = {
+            "source_model_snapshot_dir": str(source_path),
+            "text_only_model_snapshot_dir": str(target_path),
+            "reused_existing_snapshot": True,
+            "snapshot_status": inspection,
+        }
+    else:
+        print(f"Rebuilding text-only snapshot because {inspection['reason']}")
+        result = prepare_text_only_model_copy(
+            source_path=source_path,
+            target_path=target_path,
+        )
+        result["reused_existing_snapshot"] = False
+        result["snapshot_status"] = inspect_text_only_snapshot(target_path)
     hf_cache_volume.commit()
     print(json.dumps(result, indent=2))
     return result
@@ -370,6 +447,7 @@ def validate_text_only_snapshot():
     if not (snapshot_path / "config.json").exists():
         raise FileNotFoundError(f"Missing config.json under {snapshot_path}")
     config = json.loads((snapshot_path / "config.json").read_text(encoding="utf-8"))
+    inspection = inspect_text_only_snapshot(snapshot_path)
     result = {
         "model_snapshot_dir": str(snapshot_path),
         "base_model": BASE_MODEL,
@@ -380,6 +458,8 @@ def validate_text_only_snapshot():
         "architectures": config.get("architectures"),
         "text_model_type": config.get("model_type"),
         "num_experts": config.get("num_experts"),
+        "snapshot_ready": inspection["is_ready"],
+        "snapshot_ready_reason": inspection["reason"],
     }
     print(json.dumps(result, indent=2))
     return result
@@ -443,8 +523,11 @@ def train(
     )
     if strip_vision_for_training and continued_lora_dir is None:
         text_only_snapshot_path = Path(TEXT_ONLY_MODEL_SNAPSHOT_DIR)
-        if not (text_only_snapshot_path / "config.json").exists():
-            print("Preparing text-only snapshot for training...")
+        inspection = inspect_text_only_snapshot(text_only_snapshot_path)
+        if inspection["is_ready"]:
+            print("Reusing existing text-only snapshot for training...")
+        else:
+            print(f"Preparing text-only snapshot for training because {inspection['reason']}...")
             prepare_text_only_model_copy(
                 source_path=Path(MODEL_SNAPSHOT_DIR),
                 target_path=text_only_snapshot_path,

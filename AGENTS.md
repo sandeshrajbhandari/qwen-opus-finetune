@@ -41,8 +41,19 @@ The only script designed to run locally is `compare_qwen_tokenizers.py`:
 python3 compare_qwen_tokenizers.py --base-model <model> --custom-model <model>
 ```
 
+### Verifying scripts without Modal auth
+
+All scripts can be syntax-checked and import-verified locally without valid Modal credentials:
+
+```bash
+python3 -m py_compile modal_qwen35_18b_reap_a3b_coding_opus_train.py
+python3 -c "import importlib.util; spec = importlib.util.spec_from_file_location('m', 'modal_qwen35_18b_reap_a3b_coding_opus_train.py'); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); print(hasattr(mod, 'app'))"
+```
+
 ### Key caveats
 
 - PyTorch is **not** required locally — it runs inside Modal containers. The `transformers` import warning about PyTorch missing is expected and harmless.
+- Modal tokens (`MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET`) are validated against `api.modal.com` on every `modal run` or `modal token set` call. If tokens are expired or invalid, use `modal token new` on a machine with browser access to regenerate them.
+- `modal_compare_qwen_tokenizers.py` has a hardcoded local path in `.add_local_file()`; it will fail unless the path is updated to match the current workspace.
 - The `qwen3_5_(4b)_vision.py` and `qwen3_5_moe.py` files are reference Colab notebooks saved as `.py`; they are not meant to be run directly.
 - See `progress.md` for the detailed development log and `MODAL_AGENT_GUIDE.md` for Modal usage patterns.

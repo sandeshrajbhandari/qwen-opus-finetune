@@ -40,14 +40,18 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import math
 import os
 import random
+import re
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import torch
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
+from huggingface_hub import HfApi
 from trl import SFTConfig, SFTTrainer
 from unsloth import FastLanguageModel
 from unsloth.chat_templates import train_on_responses_only
@@ -80,6 +84,9 @@ class TrainSummary:
     train_loss: float | None
     peak_reserved_memory_gb: float
     output_dir: str
+    save_steps: int
+    hf_repo_id: str
+    hf_path_in_repo: str
 
 
 def parse_args() -> argparse.Namespace:
@@ -92,14 +99,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.001)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--num-train-epochs", type=float, default=1.0)
-    parser.add_argument("--max-steps", type=int, default=120, help="-1 disables max_steps.")
+    parser.add_argument("--max-steps", type=int, default=-1, help="-1 disables max_steps.")
     parser.add_argument("--per-device-train-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--max-per-dataset", type=int, default=0)
     parser.add_argument("--report-to", type=str, default="none")
     parser.add_argument("--save-merged-16bit", action="store_true")
-    parser.add_argument("--hf-repo-id", type=str, default="")
+    parser.add_argument(
+        "--hf-repo-id",
+        type=str,
+        default="sandeshrajx/qwopus-lora-tests",
+        help="Destination model repo for LoRA upload.",
+    )
+    parser.add_argument(
+        "--disable-hf-upload",
+        action="store_true",
+        help="Disable automatic LoRA upload to Hugging Face Hub.",
+    )
     parser.add_argument(
         "--datasets",
         nargs="+",
@@ -291,6 +308,14 @@ def format_to_chat_text(dataset: Dataset, tokenizer) -> Dataset:
     )
 
 
+def safe_model_subdir(model_id: str) -> str:
+    # Keep model identity readable while making it path-safe for Hub subfolders.
+    cleaned = model_id.strip().replace("/", "__")
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", cleaned)
+    cleaned = cleaned.strip("._-")
+    return cleaned or "model"
+
+
 def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
@@ -311,8 +336,8 @@ def main() -> None:
     _, tokenizer_for_format = FastLanguageModel.from_pretrained(
         model_name=args.model_id,
         max_seq_length=args.max_seq_length,
-        load_in_4bit=True,
-        load_in_16bit=False,
+        load_in_4bit=False,
+        load_in_16bit=True,
         full_finetuning=False,
     )
     del _
@@ -358,8 +383,8 @@ def main() -> None:
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.model_id,
         max_seq_length=args.max_seq_length,
-        load_in_4bit=True,
-        load_in_16bit=False,
+        load_in_4bit=False,
+        load_in_16bit=True,
         full_finetuning=False,
     )
     model = FastLanguageModel.get_peft_model(
@@ -372,7 +397,7 @@ def main() -> None:
         lora_alpha=FIXED_LORA_ALPHA,
         lora_dropout=0,
         bias="none",
-        use_gradient_checkpointing="unsloth",
+        use_gradient_checkpointing=True,
         random_state=args.seed,
         max_seq_length=args.max_seq_length,
         use_rslora=False,
@@ -380,6 +405,12 @@ def main() -> None:
     )
 
     supports_bf16 = torch.cuda.is_bf16_supported()
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    denom = args.per_device_train_batch_size * args.gradient_accumulation_steps * max(world_size, 1)
+    steps_per_epoch = max(1, math.ceil(len(train_dataset) / max(denom, 1)))
+    save_steps = max(1, steps_per_epoch // 2)
+    print(f"Estimated steps/epoch: {steps_per_epoch} | save_steps (~half epoch): {save_steps}")
+
     sft_cfg = SFTConfig(
         dataset_text_field="text",
         max_seq_length=args.max_seq_length,
@@ -398,7 +429,8 @@ def main() -> None:
         seed=args.seed,
         output_dir=str(run_dir / "trainer"),
         report_to=args.report_to,
-        save_strategy="epoch",
+        save_strategy="steps",
+        save_steps=save_steps,
         save_total_limit=2,
         dataset_num_proc=1,
         packing=False,
@@ -435,16 +467,25 @@ def main() -> None:
         )
         print(f"Saved merged 16-bit model to: {merged_dir}")
 
-    if args.hf_repo_id:
+    hf_path_in_repo = ""
+    if args.hf_repo_id and not args.disable_hf_upload:
         if "HF_TOKEN" not in os.environ:
-            raise RuntimeError("HF_TOKEN must be set to use --hf-repo-id.")
-        model.push_to_hub_merged(
-            args.hf_repo_id,
-            tokenizer,
-            save_method="lora",
-            token=os.environ["HF_TOKEN"],
+            raise RuntimeError("HF_TOKEN must be set for Hub upload.")
+        token = os.environ["HF_TOKEN"]
+        model_subdir = safe_model_subdir(args.model_id)
+        run_stamp = datetime.now(timezone.utc).strftime("run-%Y%m%d-%H%M%S")
+        hf_path_in_repo = f"{model_subdir}/{run_stamp}/lora_adapter"
+
+        api = HfApi(token=token)
+        api.create_repo(repo_id=args.hf_repo_id, repo_type="model", exist_ok=True)
+        api.upload_folder(
+            repo_id=args.hf_repo_id,
+            repo_type="model",
+            folder_path=str(adapter_dir),
+            path_in_repo=hf_path_in_repo,
+            commit_message=f"Upload LoRA adapter for {args.model_id} ({run_stamp})",
         )
-        print(f"Pushed LoRA adapter to HF repo: {args.hf_repo_id}")
+        print(f"Pushed LoRA adapter to: https://huggingface.co/{args.hf_repo_id}/tree/main/{hf_path_in_repo}")
 
     peak_memory_gb = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
     summary = TrainSummary(
@@ -463,6 +504,9 @@ def main() -> None:
         train_loss=train_output.metrics.get("train_loss"),
         peak_reserved_memory_gb=peak_memory_gb,
         output_dir=str(run_dir),
+        save_steps=save_steps,
+        hf_repo_id=args.hf_repo_id if not args.disable_hf_upload else "",
+        hf_path_in_repo=hf_path_in_repo,
     )
     summary_path = run_dir / "summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:

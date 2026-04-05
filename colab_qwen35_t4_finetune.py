@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import inspect
 import json
 import math
 import os
@@ -326,6 +327,31 @@ def format_metric_token(value: float) -> str:
     return s
 
 
+def build_sft_config_compat(base_kwargs: dict[str, Any], max_seq_length: int) -> SFTConfig:
+    """Build SFTConfig while handling TRL version differences.
+
+    Some TRL versions use `max_seq_length`, others use `max_length`.
+    This helper also drops unsupported optional kwargs gracefully.
+    """
+    sig = inspect.signature(SFTConfig.__init__)
+    supported = set(sig.parameters.keys())
+    kwargs = dict(base_kwargs)
+
+    if "max_seq_length" in supported:
+        kwargs["max_seq_length"] = max_seq_length
+    elif "max_length" in supported:
+        kwargs["max_length"] = max_seq_length
+    else:
+        print("[warn] Neither max_seq_length nor max_length found in SFTConfig; using defaults.")
+
+    filtered = {k: v for k, v in kwargs.items() if k in supported}
+    dropped = sorted(k for k in kwargs.keys() if k not in supported)
+    if dropped:
+        print(f"[warn] Dropping unsupported SFTConfig args for this TRL version: {dropped}")
+
+    return SFTConfig(**filtered)
+
+
 def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
@@ -421,9 +447,8 @@ def main() -> None:
     save_steps = max(1, steps_per_epoch // 2)
     print(f"Estimated steps/epoch: {steps_per_epoch} | save_steps (~half epoch): {save_steps}")
 
-    sft_cfg = SFTConfig(
+    sft_kwargs = dict(
         dataset_text_field="text",
-        max_seq_length=args.max_seq_length,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         warmup_steps=args.warmup_steps,
@@ -444,6 +469,10 @@ def main() -> None:
         save_total_limit=2,
         dataset_num_proc=1,
         packing=False,
+    )
+    sft_cfg = build_sft_config_compat(
+        base_kwargs=sft_kwargs,
+        max_seq_length=args.max_seq_length,
     )
 
     trainer = SFTTrainer(

@@ -316,6 +316,16 @@ def safe_model_subdir(model_id: str) -> str:
     return cleaned or "model"
 
 
+def format_metric_token(value: float) -> str:
+    # Keep floats readable and path-safe (e.g. 2e-4 -> 0p0002).
+    s = f"{value:.10f}".rstrip("0").rstrip(".")
+    if not s:
+        s = "0"
+    s = s.replace(".", "p")
+    s = s.replace("-", "m")
+    return s
+
+
 def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
@@ -474,7 +484,10 @@ def main() -> None:
         token = os.environ["HF_TOKEN"]
         model_subdir = safe_model_subdir(args.model_id)
         run_stamp = datetime.now(timezone.utc).strftime("run-%Y%m%d-%H%M%S")
-        hf_path_in_repo = f"{model_subdir}/{run_stamp}/lora_adapter"
+        epochs_token = format_metric_token(args.num_train_epochs)
+        lr_token = format_metric_token(args.learning_rate)
+        run_folder = f"{run_stamp}-e{epochs_token}-lr{lr_token}"
+        hf_path_in_repo = f"{model_subdir}/{run_folder}/lora_adapter"
 
         api = HfApi(token=token)
         api.create_repo(repo_id=args.hf_repo_id, repo_type="model", exist_ok=True)

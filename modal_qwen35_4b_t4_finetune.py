@@ -250,7 +250,7 @@ def format_metric_token(value: float) -> str:
 
 @app.function(
     image=image,
-    gpu="T4",
+    gpu="L4",
     timeout=240 * MINUTES,
     volumes={
         HF_CACHE_DIR: hf_cache_volume,

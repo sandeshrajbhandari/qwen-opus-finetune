@@ -260,7 +260,7 @@ def build_sft_config_compat(SFTConfig, base_kwargs: dict[str, Any], max_seq_leng
         kwargs["max_length"] = max_seq_length
     post_set = {}
     for attr in ("eos_token", "pad_token"):
-        if attr in kwargs and attr not in supported:
+        if attr in kwargs:
             post_set[attr] = kwargs.pop(attr)
     filtered = {k: v for k, v in kwargs.items() if k in supported}
     dropped = sorted(k for k in kwargs.keys() if k not in supported)

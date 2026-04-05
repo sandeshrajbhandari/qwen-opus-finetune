@@ -367,7 +367,6 @@ def train(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
-    tokenizer = processor.tokenizer # To tokenize text
 
     # Matches the precise configuration & structure from the reference 
     model = FastLanguageModel.get_peft_model(

@@ -307,7 +307,7 @@ def validate_patched_config():
 @app.function(
     image=image,
     gpu=["A100-80GB"],
-    timeout=120 * MINUTES,
+    timeout=240 * MINUTES,
     volumes={
         HF_CACHE_DIR: hf_cache_volume,
         OUTPUT_ROOT: outputs_volume,

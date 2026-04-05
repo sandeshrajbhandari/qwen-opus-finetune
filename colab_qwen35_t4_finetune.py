@@ -54,6 +54,7 @@ import torch
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
 from huggingface_hub import HfApi
 from trl import SFTConfig, SFTTrainer
+from transformers import AutoTokenizer
 from unsloth import FastLanguageModel
 from unsloth.chat_templates import train_on_responses_only
 
@@ -384,6 +385,50 @@ def build_sft_trainer_compat(
     return SFTTrainer(**trainer_kwargs)
 
 
+def resolve_text_tokenizer(tokenizer_or_processor: Any, model_id: str):
+    """
+    Normalize tokenizer/processor to a text tokenizer and ensure EOS/PAD are valid.
+
+    Some Qwen checkpoints return a processor object (e.g. Qwen3VLProcessor). For
+    text SFT, we need a tokenizer whose eos_token exists in vocab.
+    """
+    text_tokenizer = getattr(tokenizer_or_processor, "tokenizer", tokenizer_or_processor)
+    if not hasattr(text_tokenizer, "get_vocab"):
+        text_tokenizer = AutoTokenizer.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            use_fast=False,
+        )
+
+    vocab = text_tokenizer.get_vocab()
+    eos = getattr(text_tokenizer, "eos_token", None)
+    eos_id = getattr(text_tokenizer, "eos_token_id", None)
+
+    if eos is None or eos not in vocab:
+        replacement = None
+        if eos_id is not None:
+            candidate = text_tokenizer.convert_ids_to_tokens(eos_id)
+            if candidate in vocab:
+                replacement = candidate
+        if replacement is None and "<|im_end|>" in vocab:
+            replacement = "<|im_end|>"
+        if replacement is not None:
+            text_tokenizer.eos_token = replacement
+
+    pad = getattr(text_tokenizer, "pad_token", None)
+    if pad is None or pad not in vocab:
+        if text_tokenizer.eos_token is not None:
+            text_tokenizer.pad_token = text_tokenizer.eos_token
+
+    text_tokenizer.padding_side = "right"
+    print(
+        "Tokenizer sanity:"
+        f" eos_token={text_tokenizer.eos_token!r} eos_id={text_tokenizer.eos_token_id}"
+        f" pad_token={text_tokenizer.pad_token!r} pad_id={text_tokenizer.pad_token_id}"
+    )
+    return text_tokenizer
+
+
 def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
@@ -408,6 +453,7 @@ def main() -> None:
         load_in_16bit=True,
         full_finetuning=False,
     )
+    tokenizer_for_format = resolve_text_tokenizer(tokenizer_for_format, args.model_id)
     del _
     gc.collect()
     torch.cuda.empty_cache()
@@ -455,6 +501,7 @@ def main() -> None:
         load_in_16bit=True,
         full_finetuning=False,
     )
+    tokenizer = resolve_text_tokenizer(tokenizer, args.model_id)
     model = FastLanguageModel.get_peft_model(
         model,
         r=FIXED_LORA_R,
@@ -471,6 +518,10 @@ def main() -> None:
         use_rslora=False,
         loftq_config=None,
     )
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+        model.config.eos_token_id = tokenizer.eos_token_id
+    if getattr(tokenizer, "pad_token_id", None) is not None:
+        model.config.pad_token_id = tokenizer.pad_token_id
 
     supports_bf16 = torch.cuda.is_bf16_supported()
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -501,6 +552,8 @@ def main() -> None:
         save_total_limit=2,
         dataset_num_proc=1,
         packing=False,
+        eos_token=tokenizer.eos_token,
+        pad_token=tokenizer.pad_token,
     )
     sft_cfg = build_sft_config_compat(
         base_kwargs=sft_kwargs,

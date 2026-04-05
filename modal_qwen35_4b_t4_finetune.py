@@ -1,5 +1,7 @@
 """Fine-tune Qwen3.5-4B on Modal T4 with normalized mixed datasets.
 
+Modeled after modal_qwen35_18b_reap_a3b_coding_opus_train.py.
+
 Usage:
   modal run modal_qwen35_4b_t4_finetune.py
   modal run modal_qwen35_4b_t4_finetune.py --max-steps 20 --max-train-samples 256
@@ -8,12 +10,12 @@ Usage:
 
 from __future__ import annotations
 
-import inspect
 import json
 import math
 import os
 import random
 import re
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -113,10 +115,6 @@ class RunSummary:
 def make_run_name(max_seq_length: int, epochs: float, learning_rate: float) -> str:
     lr = str(learning_rate).replace(".", "p")
     return f"qwen35-4b-t4-msl{max_seq_length}-e{str(epochs).replace('.', '_')}-lr{lr}"
-
-
-def seed_everything(seed: int) -> None:
-    random.seed(seed)
 
 
 def _as_text(value: Any) -> str:
@@ -250,80 +248,6 @@ def format_metric_token(value: float) -> str:
     return s.replace(".", "p").replace("-", "m")
 
 
-def build_sft_config_compat(SFTConfig, base_kwargs: dict[str, Any], max_seq_length: int):
-    sig = inspect.signature(SFTConfig.__init__)
-    supported = set(sig.parameters.keys())
-    kwargs = dict(base_kwargs)
-    if "max_seq_length" in supported:
-        kwargs["max_seq_length"] = max_seq_length
-    elif "max_length" in supported:
-        kwargs["max_length"] = max_seq_length
-    for attr in ("eos_token", "pad_token"):
-        kwargs.pop(attr, None)
-        if attr in supported:
-            kwargs[attr] = None
-    filtered = {k: v for k, v in kwargs.items() if k in supported}
-    dropped = sorted(k for k in kwargs.keys() if k not in supported)
-    if dropped:
-        print(f"[warn] Dropping unsupported SFTConfig args for this TRL version: {dropped}")
-    return SFTConfig(**filtered)
-
-
-def build_sft_trainer_compat(SFTTrainer, *, model, tokenizer, train_dataset, sft_cfg):
-    sig = inspect.signature(SFTTrainer.__init__)
-    supported = set(sig.parameters.keys())
-    trainer_kwargs: dict[str, Any] = {
-        "model": model,
-        "train_dataset": train_dataset,
-        "args": sft_cfg,
-    }
-    if "tokenizer" in supported:
-        trainer_kwargs["tokenizer"] = tokenizer
-    elif "processing_class" in supported:
-        trainer_kwargs["processing_class"] = tokenizer
-    return SFTTrainer(**trainer_kwargs)
-
-
-def resolve_text_tokenizer(tokenizer_or_processor: Any, model_id: str):
-    from transformers import AutoTokenizer
-
-    text_tokenizer = getattr(tokenizer_or_processor, "tokenizer", tokenizer_or_processor)
-    if not hasattr(text_tokenizer, "get_vocab"):
-        text_tokenizer = AutoTokenizer.from_pretrained(
-            model_id,
-            trust_remote_code=True,
-            use_fast=False,
-        )
-
-    vocab = text_tokenizer.get_vocab()
-    eos = getattr(text_tokenizer, "eos_token", None)
-    eos_id = getattr(text_tokenizer, "eos_token_id", None)
-
-    if eos is None or eos not in vocab:
-        replacement = None
-        if eos_id is not None:
-            candidate = text_tokenizer.convert_ids_to_tokens(eos_id)
-            if candidate in vocab:
-                replacement = candidate
-        if replacement is None and "<|im_end|>" in vocab:
-            replacement = "<|im_end|>"
-        if replacement is not None:
-            text_tokenizer.eos_token = replacement
-
-    pad = getattr(text_tokenizer, "pad_token", None)
-    if pad is None or pad not in vocab:
-        if text_tokenizer.eos_token is not None:
-            text_tokenizer.pad_token = text_tokenizer.eos_token
-
-    text_tokenizer.padding_side = "right"
-    print(
-        "Tokenizer sanity:"
-        f" eos_token={text_tokenizer.eos_token!r} eos_id={text_tokenizer.eos_token_id}"
-        f" pad_token={text_tokenizer.pad_token!r} pad_id={text_tokenizer.pad_token_id}"
-    )
-    return text_tokenizer
-
-
 @app.function(
     image=image,
     gpu="T4",
@@ -354,13 +278,16 @@ def train(
     hf_token: str = "",
 ):
     import torch
+    import unsloth
     from datasets import concatenate_datasets, load_dataset
     from huggingface_hub import HfApi
-    from trl import SFTConfig, SFTTrainer
     from unsloth import FastLanguageModel
     from unsloth.chat_templates import train_on_responses_only
+    from trl import SFTConfig, SFTTrainer
 
-    seed_everything(seed)
+    random.seed(seed)
+    job_start_time = time.perf_counter()
+
     dataset_names = json.loads(datasets_json) if datasets_json else list(DEFAULT_DATASETS)
     run_name = make_run_name(max_seq_length=max_seq_length, epochs=epochs, learning_rate=learning_rate)
     run_output_dir = Path(OUTPUT_ROOT) / run_name
@@ -368,16 +295,32 @@ def train(
     lora_output_dir = run_output_dir / "lora_adapter"
     run_output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Loading tokenizer/model for formatting...")
-    _, tokenizer_for_format = FastLanguageModel.from_pretrained(
+    # ----- Load model & tokenizer (same pattern as 18b script) -----
+    print("Loading base model...")
+    model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_id,
         max_seq_length=max_seq_length,
         load_in_4bit=True,
-        load_in_16bit=False,
-        full_finetuning=False,
     )
-    tokenizer_for_format = resolve_text_tokenizer(tokenizer_for_format, model_id)
 
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=lora_r,
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ],
+        lora_alpha=lora_alpha,
+        use_gradient_checkpointing=True,
+        random_state=seed,
+        bias="none",
+    )
+
+    # ----- Load & normalize datasets -----
     normalized_parts = []
     for dataset_name in dataset_names:
         print(f"\n=== Loading dataset: {dataset_name} ===")
@@ -408,66 +351,52 @@ def train(
         merged = merged.select(range(max_train_samples))
         print(f"Applied global max-train-samples cap: {max_train_samples}")
 
+    # ----- Format into chat text (same pattern as 18b script) -----
     def _fmt(example):
-        text = tokenizer_for_format.apply_chat_template(
-            [
-                {"role": "user", "content": example["prompt"]},
-                {"role": "assistant", "content": example["assistant"]},
-            ],
+        assistant_text = example["assistant"]
+        messages = [
+            {"role": "user", "content": example["prompt"]},
+            {"role": "assistant", "content": assistant_text},
+        ]
+        text = tokenizer.apply_chat_template(
+            messages,
             tokenize=False,
             add_generation_prompt=False,
         )
-        return {"text": text, "source_dataset": example["source_dataset"]}
+        return {"text": text}
 
     train_dataset = merged.map(
         _fmt,
         remove_columns=merged.column_names,
         desc="Applying chat template",
     )
-    del tokenizer_for_format
 
-    print("Loading train model...")
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_id,
-        max_seq_length=max_seq_length,
-        load_in_4bit=True,
-        load_in_16bit=False,
-        full_finetuning=False,
-    )
-    tokenizer = resolve_text_tokenizer(tokenizer, model_id)
-
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=lora_r,
-        finetune_vision_layers=False,
-        finetune_language_layers=True,
-        finetune_attention_modules=True,
-        finetune_mlp_modules=True,
-        lora_alpha=lora_alpha,
-        lora_dropout=0,
-        bias="none",
-        use_gradient_checkpointing=True,
-        random_state=seed,
-        max_seq_length=max_seq_length,
-        use_rslora=False,
-        loftq_config=None,
-    )
-    if getattr(tokenizer, "eos_token_id", None) is not None:
-        model.config.eos_token_id = tokenizer.eos_token_id
-    if getattr(tokenizer, "pad_token_id", None) is not None:
-        model.config.pad_token_id = tokenizer.pad_token_id
-
+    # ----- Training setup -----
+    gpu_stats = torch.cuda.get_device_properties(0)
     supports_bf16 = torch.cuda.is_bf16_supported()
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    denom = per_device_train_batch_size * gradient_accumulation_steps * max(world_size, 1)
-    steps_per_epoch = max(1, math.ceil(len(train_dataset) / max(denom, 1)))
-    save_steps = max(1, steps_per_epoch // 2)
-    print(f"Estimated steps/epoch: {steps_per_epoch} | save_steps (~half epoch): {save_steps}")
+    start_gpu_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
+    max_memory = round(gpu_stats.total_memory / 1024 / 1024 / 1024, 3)
+    print(f"Dataset rows = {len(train_dataset)}")
+    print(f"GPU = {gpu_stats.name}. Max memory = {max_memory} GB.")
+    print(f"{start_gpu_memory} GB of memory reserved before training.")
+    print(f"bf16 supported = {supports_bf16}")
 
-    sft_cfg = build_sft_config_compat(
-        SFTConfig,
-        base_kwargs=dict(
+    effective_batch_size = per_device_train_batch_size * gradient_accumulation_steps
+    steps_per_epoch = math.ceil(len(train_dataset) / effective_batch_size)
+    save_steps = max(1, steps_per_epoch // 2)
+    setup_seconds = time.perf_counter() - job_start_time
+
+    print(f"Effective batch size = {effective_batch_size}")
+    print(f"Steps per epoch = {steps_per_epoch}")
+
+    # ----- SFTTrainer (direct, same as 18b script) -----
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=train_dataset,
+        args=SFTConfig(
             dataset_text_field="text",
+            max_length=max_seq_length,
             per_device_train_batch_size=per_device_train_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
             warmup_steps=warmup_steps,
@@ -483,24 +412,13 @@ def train(
             seed=seed,
             output_dir=str(trainer_output_dir),
             report_to=report_to,
+            dataset_num_proc=1,
             save_strategy="steps",
             save_steps=save_steps,
             save_total_limit=2,
-            dataset_num_proc=1,
-            packing=False,
-            eos_token=tokenizer.eos_token,
-            pad_token=tokenizer.pad_token,
         ),
-        max_seq_length=max_seq_length,
     )
 
-    trainer = build_sft_trainer_compat(
-        SFTTrainer,
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=train_dataset,
-        sft_cfg=sft_cfg,
-    )
     trainer = train_on_responses_only(
         trainer,
         instruction_part="<|im_start|>user\n",
@@ -510,6 +428,7 @@ def train(
     print("Starting training...")
     stats = trainer.train()
 
+    # ----- Save -----
     lora_output_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(lora_output_dir))
     tokenizer.save_pretrained(str(lora_output_dir))
@@ -537,7 +456,8 @@ def train(
         )
         print(f"Pushed LoRA adapter to: https://huggingface.co/{hf_repo_id}/tree/main/{hf_path_in_repo}")
 
-    peak_memory_gb = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
+    # ----- Summary -----
+    used_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
     summary = RunSummary(
         run_name=run_name,
         base_model=model_id,
@@ -548,13 +468,13 @@ def train(
         save_steps=save_steps,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
-        effective_batch_size=per_device_train_batch_size * gradient_accumulation_steps,
+        effective_batch_size=effective_batch_size,
         learning_rate=learning_rate,
         lora_r=lora_r,
         lora_alpha=lora_alpha,
         train_runtime_seconds=stats.metrics.get("train_runtime"),
         train_loss=stats.metrics.get("train_loss"),
-        peak_reserved_memory_gb=peak_memory_gb,
+        peak_reserved_memory_gb=used_memory,
         output_dir=str(run_output_dir),
         hf_repo_id=hf_repo_id,
         hf_path_in_repo=hf_path_in_repo,

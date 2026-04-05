@@ -53,7 +53,14 @@ python3 -c "import importlib.util; spec = importlib.util.spec_from_file_location
 ### Key caveats
 
 - PyTorch is **not** required locally — it runs inside Modal containers. The `transformers` import warning about PyTorch missing is expected and harmless.
-- Modal tokens (`MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET`) are validated against `api.modal.com` on every `modal run` or `modal token set` call. If tokens are expired or invalid, use `modal token new` on a machine with browser access to regenerate them.
+- **Modal token whitespace gotcha**: The `MODAL_TOKEN_SECRET` environment variable may contain trailing whitespace from secret injection. Before any Modal call in Python, trim both tokens:
+  ```python
+  import os
+  os.environ['MODAL_TOKEN_ID'] = os.environ.get('MODAL_TOKEN_ID', '').strip()
+  os.environ['MODAL_TOKEN_SECRET'] = os.environ.get('MODAL_TOKEN_SECRET', '').strip()
+  ```
+  For CLI usage, wrap in trimming: `modal token set --token-id "$(echo -n $MODAL_TOKEN_ID | tr -d '[:space:]')" --token-secret "$(echo -n $MODAL_TOKEN_SECRET | tr -d '[:space:]')"`
+- If tokens are expired or invalid (even after trimming), use `modal token new` on a machine with browser access to regenerate them.
 - `modal_compare_qwen_tokenizers.py` has a hardcoded local path in `.add_local_file()`; it will fail unless the path is updated to match the current workspace.
 - The `qwen3_5_(4b)_vision.py` and `qwen3_5_moe.py` files are reference Colab notebooks saved as `.py`; they are not meant to be run directly.
 - See `progress.md` for the detailed development log and `MODAL_AGENT_GUIDE.md` for Modal usage patterns.

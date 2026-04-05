@@ -352,6 +352,38 @@ def build_sft_config_compat(base_kwargs: dict[str, Any], max_seq_length: int) ->
     return SFTConfig(**filtered)
 
 
+def build_sft_trainer_compat(
+    *,
+    model,
+    tokenizer,
+    train_dataset: Dataset,
+    sft_cfg: SFTConfig,
+) -> SFTTrainer:
+    """Build SFTTrainer compatibly across TRL versions.
+
+    TRL versions differ on whether they accept `tokenizer` or `processing_class`.
+    """
+    sig = inspect.signature(SFTTrainer.__init__)
+    supported = set(sig.parameters.keys())
+    trainer_kwargs: dict[str, Any] = {
+        "model": model,
+        "train_dataset": train_dataset,
+        "args": sft_cfg,
+    }
+
+    if "tokenizer" in supported:
+        trainer_kwargs["tokenizer"] = tokenizer
+    elif "processing_class" in supported:
+        trainer_kwargs["processing_class"] = tokenizer
+    else:
+        print(
+            "[warn] SFTTrainer accepts neither tokenizer nor processing_class;"
+            " relying on model defaults."
+        )
+
+    return SFTTrainer(**trainer_kwargs)
+
+
 def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
@@ -475,16 +507,16 @@ def main() -> None:
         max_seq_length=args.max_seq_length,
     )
 
-    trainer = SFTTrainer(
+    trainer = build_sft_trainer_compat(
         model=model,
         tokenizer=tokenizer,
         train_dataset=train_dataset,
-        args=sft_cfg,
+        sft_cfg=sft_cfg,
     )
     trainer = train_on_responses_only(
         trainer,
         instruction_part="<|im_start|>user\n",
-        response_part="<|im_start|>assistant\n",
+        response_part="<|im_start|>assistant\n<think>",
     )
 
     print("Training...")

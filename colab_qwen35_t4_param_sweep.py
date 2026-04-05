@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import inspect
 import json
 import os
 import random
@@ -369,6 +370,31 @@ def load_sweep(path: str) -> list[dict[str, Any]]:
     return data
 
 
+def make_sft_config(max_seq_length: int, **kwargs: Any) -> SFTConfig:
+    """
+    Build SFTConfig compatibly across TRL versions:
+    - newer variants may expect `max_seq_length`
+    - others use `max_length`
+    Also drops unsupported optional kwargs for older versions.
+    """
+    sig = inspect.signature(SFTConfig.__init__)
+    params = sig.parameters
+
+    cfg_kwargs = dict(kwargs)
+    if "max_seq_length" in params:
+        cfg_kwargs["max_seq_length"] = max_seq_length
+    elif "max_length" in params:
+        cfg_kwargs["max_length"] = max_seq_length
+    else:
+        print("[warn] Neither max_seq_length nor max_length is supported by this TRL SFTConfig.")
+
+    filtered = {k: v for k, v in cfg_kwargs.items() if k in params}
+    dropped = sorted(set(cfg_kwargs) - set(filtered))
+    if dropped:
+        print(f"[warn] Dropping unsupported SFTConfig args for this TRL version: {dropped}")
+    return SFTConfig(**filtered)
+
+
 def train_one_run(
     run_cfg: dict[str, Any],
     args: argparse.Namespace,
@@ -407,9 +433,9 @@ def train_one_run(
     )
 
     supports_bf16 = torch.cuda.is_bf16_supported()
-    sft_cfg = SFTConfig(
-        dataset_text_field="text",
+    sft_cfg = make_sft_config(
         max_seq_length=args.max_seq_length,
+        dataset_text_field="text",
         per_device_train_batch_size=int(run_cfg["per_device_train_batch_size"]),
         gradient_accumulation_steps=int(run_cfg["gradient_accumulation_steps"]),
         warmup_steps=args.warmup_steps,

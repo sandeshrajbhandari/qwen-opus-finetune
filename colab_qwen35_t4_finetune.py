@@ -345,19 +345,14 @@ def build_sft_config_compat(base_kwargs: dict[str, Any], max_seq_length: int) ->
     else:
         print("[warn] Neither max_seq_length nor max_length found in SFTConfig; using defaults.")
 
-    post_set = {}
     for attr in ("eos_token", "pad_token"):
-        if attr in kwargs:
-            post_set[attr] = kwargs.pop(attr)
+        kwargs.pop(attr, None)
     filtered = {k: v for k, v in kwargs.items() if k in supported}
     dropped = sorted(k for k in kwargs.keys() if k not in supported)
     if dropped:
         print(f"[warn] Dropping unsupported SFTConfig args for this TRL version: {dropped}")
 
-    cfg = SFTConfig(**filtered)
-    for attr, val in post_set.items():
-        setattr(cfg, attr, val)
-    return cfg
+    return SFTConfig(**filtered)
 
 
 def build_sft_trainer_compat(

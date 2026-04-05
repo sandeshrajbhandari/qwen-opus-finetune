@@ -258,18 +258,13 @@ def build_sft_config_compat(SFTConfig, base_kwargs: dict[str, Any], max_seq_leng
         kwargs["max_seq_length"] = max_seq_length
     elif "max_length" in supported:
         kwargs["max_length"] = max_seq_length
-    post_set = {}
     for attr in ("eos_token", "pad_token"):
-        if attr in kwargs:
-            post_set[attr] = kwargs.pop(attr)
+        kwargs.pop(attr, None)
     filtered = {k: v for k, v in kwargs.items() if k in supported}
     dropped = sorted(k for k in kwargs.keys() if k not in supported)
     if dropped:
         print(f"[warn] Dropping unsupported SFTConfig args for this TRL version: {dropped}")
-    cfg = SFTConfig(**filtered)
-    for attr, val in post_set.items():
-        setattr(cfg, attr, val)
-    return cfg
+    return SFTConfig(**filtered)
 
 
 def build_sft_trainer_compat(SFTTrainer, *, model, tokenizer, train_dataset, sft_cfg):

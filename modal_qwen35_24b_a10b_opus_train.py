@@ -46,6 +46,7 @@ DEFAULT_LORA_R = 32
 DEFAULT_LORA_ALPHA = 64 
 DEFAULT_WARMUP_STEPS = 2
 DEFAULT_SEED = 3407
+DEFAULT_TRAIN_ROUTER_WEIGHT = False
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +498,7 @@ def train(
     continue_from_run_name: str = "",
     output_run_name: str = "",
     strip_vision_for_training: bool = False,
+    train_router_weight: bool = DEFAULT_TRAIN_ROUTER_WEIGHT,
 ):
     import torch
     import unsloth
@@ -569,14 +571,17 @@ def train(
     if processor_tokenizer is not None and hasattr(processor_tokenizer, "apply_chat_template"):
         tokenizer = processor_tokenizer
 
+    target_modules = [
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj", "gate_up_proj",
+    ]
+    router_weight_parameter_names = []
+
     if continued_lora_dir is None:
         model = FastLanguageModel.get_peft_model(
             model,
             r=lora_r,
-            target_modules=[
-                "q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_proj", "up_proj", "down_proj", "gate_up_proj",
-            ],
+            target_modules=target_modules,
             lora_alpha=lora_r * 2,
             use_gradient_checkpointing=True,
             random_state=seed,
@@ -588,6 +593,15 @@ def train(
         if hasattr(model, "enable_adapter_layers"):
             model.enable_adapter_layers()
         print(f"Continuing training from saved adapter at {continued_lora_dir}")
+
+    if train_router_weight:
+        for parameter_name, parameter in model.named_parameters():
+            if parameter_name.endswith("mlp.gate.weight"):
+                parameter.requires_grad = True
+                router_weight_parameter_names.append(parameter_name)
+        if not router_weight_parameter_names:
+            raise RuntimeError("Requested router-weight training, but no `mlp.gate.weight` parameters were found.")
+        print(f"Unfroze {len(router_weight_parameter_names)} router weight tensors for training.")
 
     print("Loading dataset...")
     dataset = load_dataset(
@@ -778,6 +792,10 @@ def train(
         "learning_rate": learning_rate,
         "lora_r": lora_r,
         "lora_alpha": lora_r * 2,
+        "train_router_weight": train_router_weight,
+        "router_weight_parameter_count": len(router_weight_parameter_names),
+        "router_weight_parameter_names": router_weight_parameter_names,
+        "lora_target_modules": target_modules,
         "load_in_4bit": False,
         "load_in_16bit": True,
         "output_dir": str(run_output_dir),
@@ -826,6 +844,7 @@ def main(
     continue_from_run_name: str = "",
     output_run_name: str = "",
     strip_vision_for_training: bool = False,
+    train_router_weight: bool = DEFAULT_TRAIN_ROUTER_WEIGHT,
 ):
     download_model.remote()
     validate_snapshot.remote()
@@ -854,4 +873,5 @@ def main(
         continue_from_run_name=continue_from_run_name,
         output_run_name=output_run_name,
         strip_vision_for_training=strip_vision_for_training,
+        train_router_weight=train_router_weight,
     )

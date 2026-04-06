@@ -31,13 +31,13 @@ HF_CACHE_DIR = "/root/.cache/huggingface"
 MODEL_SNAPSHOT_DIR = f"{HF_CACHE_DIR}/preloaded/flagstone_qwen35_18b_reap_a3b_coding"
 
 DEFAULT_MAX_SEQ_LENGTH = 8192
-DEFAULT_EPOCHS = 1
+DEFAULT_EPOCHS = 2
 # RECOMMENDED: Change batch size to 1 and gradient accumulation to 6 to avoid OOM
 DEFAULT_PER_DEVICE_BATCH_SIZE = 6
-DEFAULT_GRADIENT_ACCUMULATION_STEPS = 1
+DEFAULT_GRADIENT_ACCUMULATION_STEPS = 4
 DEFAULT_LEARNING_RATE = 6e-5
-DEFAULT_LORA_R = 16 
-DEFAULT_LORA_ALPHA = 32
+DEFAULT_LORA_R = 32
+DEFAULT_LORA_ALPHA = 64
 DEFAULT_WARMUP_STEPS = 2
 DEFAULT_SEED = 3407
 
@@ -101,6 +101,16 @@ MINUTES = 60
 
 def make_run_name(max_seq_length: int, epochs: float) -> str:
     return f"qwen35-18b-reap-a3b-coding-opus-msl{max_seq_length}-e{str(epochs).replace('.', '_')}"
+
+
+def resolve_run_output_dir(
+    output_root: Path,
+    max_seq_length: int,
+    epochs: float,
+    output_run_name: str,
+) -> Path:
+    run_name = output_run_name or make_run_name(max_seq_length=max_seq_length, epochs=epochs)
+    return output_root / run_name
 
 
 def resolve_checkpoint_path(base_dir: Path, resume_from_checkpoint: str) -> str | None:
@@ -333,6 +343,8 @@ def train(
     hf_repo_id: str = "",
     save_merged_16bit: bool = False,
     report_to: str = "none",
+    continue_from_run_name: str = "",
+    output_run_name: str = "",
 ):
     import torch
     import unsloth
@@ -342,46 +354,75 @@ def train(
     from transformers import AutoTokenizer
     from trl import SFTConfig, SFTTrainer
 
-    run_name = make_run_name(max_seq_length=max_seq_length, epochs=epochs)
-    run_output_dir = Path(OUTPUT_ROOT) / run_name
+    run_output_dir = resolve_run_output_dir(
+        output_root=Path(OUTPUT_ROOT),
+        max_seq_length=max_seq_length,
+        epochs=epochs,
+        output_run_name=output_run_name,
+    )
+    run_name = run_output_dir.name
     lora_output_dir = run_output_dir / "lora"
     trainer_output_dir = run_output_dir / "trainer"
     run_output_dir.mkdir(parents=True, exist_ok=True)
+    continued_lora_dir = (
+        Path(OUTPUT_ROOT) / continue_from_run_name / "lora"
+        if continue_from_run_name
+        else None
+    )
 
     job_start_time = time.perf_counter()
+
+    model_load_path = (
+        str(continued_lora_dir)
+        if continued_lora_dir is not None
+        else MODEL_SNAPSHOT_DIR if Path(MODEL_SNAPSHOT_DIR).exists() else BASE_MODEL
+    )
+    if continued_lora_dir is not None and not continued_lora_dir.exists():
+        raise FileNotFoundError(f"Continuation LoRA directory not found: {continued_lora_dir}")
 
     print("Loading base model...")
     # Matches the boolean flags from the reference
     model, processor = FastLanguageModel.from_pretrained(
-        MODEL_SNAPSHOT_DIR if Path(MODEL_SNAPSHOT_DIR).exists() else BASE_MODEL,
+        model_load_path,
         max_seq_length=max_seq_length,
         load_in_4bit=False,
         fast_inference=False, # Not supported for MoE (yet!)
     )
     
     tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_SNAPSHOT_DIR if Path(MODEL_SNAPSHOT_DIR).exists() else BASE_MODEL,
+        model_load_path,
         trust_remote_code=True,
         use_fast=False,
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
-    tokenizer = processor.tokenizer # To tokenize text
+    processor_tokenizer = getattr(processor, "tokenizer", None)
+    if processor_tokenizer is None:
+        processor_tokenizer = getattr(processor, "_tokenizer", None)
+    if processor_tokenizer is not None and hasattr(processor_tokenizer, "apply_chat_template"):
+        tokenizer = processor_tokenizer
 
     # Matches the precise configuration & structure from the reference 
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r = lora_r, 
-        target_modules = [
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj", "gate_up_proj", #Enable LoRA on MoE layers
-        ],
-        lora_alpha = lora_r * 2, # *2 speeds up training as per reference (overriding input alpha if needed)
-        use_gradient_checkpointing = True, # Reduces memory usage
-        random_state = seed,
-        bias = "none",
-    )
+    if continued_lora_dir is None:
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r = lora_r,
+            target_modules = [
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj", "gate_up_proj", #Enable LoRA on MoE layers
+            ],
+            lora_alpha = lora_r * 2, # *2 speeds up training as per reference (overriding input alpha if needed)
+            use_gradient_checkpointing = True, # Reduces memory usage
+            random_state = seed,
+            bias = "none",
+        )
+    else:
+        if hasattr(FastLanguageModel, "for_training"):
+            FastLanguageModel.for_training(model)
+        if hasattr(model, "enable_adapter_layers"):
+            model.enable_adapter_layers()
+        print(f"Continuing training from saved adapter at {continued_lora_dir}")
 
     print("Loading dataset...")
     dataset = load_dataset(
@@ -561,7 +602,8 @@ def train(
 
     summary = {
         "base_model": BASE_MODEL,
-        "model_load_path": MODEL_SNAPSHOT_DIR if Path(MODEL_SNAPSHOT_DIR).exists() else BASE_MODEL,
+        "model_load_path": model_load_path,
+        "continue_from_run_name": continue_from_run_name or None,
         "dataset_name": dataset_name,
         "dataset_split": dataset_split,
         "dataset_revision": dataset_revision,
@@ -625,6 +667,8 @@ def main(
     hf_repo_id: str = "",
     save_merged_16bit: bool = False,
     report_to: str = "none",
+    continue_from_run_name: str = "",
+    output_run_name: str = "",
 ):
     download_model.remote()
     validate_patched_config.remote()
@@ -647,4 +691,6 @@ def main(
         hf_repo_id=hf_repo_id,
         save_merged_16bit=save_merged_16bit,
         report_to=report_to,
+        continue_from_run_name=continue_from_run_name,
+        output_run_name=output_run_name,
     )

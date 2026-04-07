@@ -4,6 +4,7 @@ __pycache__/
 *.pyd
 
 .hf_compare_cache/
+unsloth_compiled_cache/
 .DS_Store
 
 .env

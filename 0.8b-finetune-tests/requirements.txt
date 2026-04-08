@@ -1,0 +1,15 @@
+hf_transfer
+huggingface-hub
+datasets
+transformers
+trl
+peft
+accelerate
+sentencepiece
+protobuf
+torch
+bitsandbytes
+xformers
+unsloth
+triton>=3.3.0; platform_system != "Windows"
+triton-windows>=3.6.0; platform_system == "Windows"

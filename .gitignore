@@ -12,3 +12,10 @@ unsloth_compiled_cache/
 venv/
 
 *.log
+
+# Local model downloads and finetune artifacts
+0.8b-finetune-tests/Qwen3.5-0.8B/
+9b-int4-finetune-tests/Qwen3.5-9B-int4-AutoRound/
+0.8b-finetune-tests/outputs/
+tmp_qwen35_24b_*.json
+=3.3.0
